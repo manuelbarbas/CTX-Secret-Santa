@@ -1,0 +1,19 @@
+{
+  "name": "secret-santa-contracts",
+  "version": "1.0.0",
+  "description": "Secret Santa smart contracts with BITE V2 integration",
+  "private": true,
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy": "hardhat run scripts/deploy.ts --network skale",
+    "node": "hardhat node"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@types/node": "^22.10.2",
+    "hardhat": "^2.22.17",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.2"
+  }
+}
