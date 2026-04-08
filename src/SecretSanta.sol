@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity >=0.8.27;
+
+import { IBiteSupplicant } from "@skalenetwork/bite-solidity/interfaces/IBiteSupplicant.sol";
+import { BITE, PublicKey } from "@skalenetwork/bite-solidity/BITE.sol";
+import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
+import { Address } from "@openzeppelin/contracts/utils/Address.sol";
 
 /**
  * @title SecretSanta
  * @notice Privacy-preserving Secret Santa contract using BITE V2 threshold encryption
- * @dev Participants register encrypted wishlists, then reveal after assignment
+ * @dev Participants register encrypted wishlists, then reveal after assignment with CTX automatic decryption
  */
-contract SecretSanta {
+contract SecretSanta is IBiteSupplicant, Ownable {
+    using Address for address payable;
+
     // ============================================
     // STATE VARIABLES
     // ============================================
@@ -23,6 +30,26 @@ contract SecretSanta {
     /// @notice Total number of participants
     uint256 public participantCount;
 
+    /// @notice Testing mode flag
+    bool public testingMode = false;
+
+    // ============================================
+    // CTX CONSTANTS
+    // ============================================
+
+    /// @notice Minimum callback gas required for CTX execution
+    uint256 public minCallbackGas = 300_000;
+
+    /// @notice Minimum gas payment required (0.06 CREDIT)
+    uint256 public constant MIN_GAS_PAYMENT = 0.06 ether;
+
+    // ============================================
+    // ERRORS
+    // ============================================
+
+    error AccessDenied();
+    error NotEnoughValueSentForGas();
+
     // ============================================
     // STRUCTS
     // ============================================
@@ -32,13 +59,6 @@ contract SecretSanta {
         address addr;                  // Participant address
         bytes encryptedWishlist;       // BITE encrypted (address shippingAddress, string wishlist)
         bool registered;               // Registration status
-    }
-
-    /// @notice Decryption request information
-    struct DecryptionRequest {
-        address requester;             // Santa requesting decryption
-        uint256 recipientIndex;        // Index of recipient in participantList
-        bool fulfilled;                // Whether decryption was completed
     }
 
     // ============================================
@@ -57,11 +77,8 @@ contract SecretSanta {
     /// @notice Mapping from Santa to their decrypted recipient wishlist
     mapping(address => bytes) public recipientWishlists;
 
-    /// @notice Decryption requests by index
-    mapping(uint256 => DecryptionRequest) public decryptionRequests;
-
-    /// @notice Total number of decryption requests
-    uint256 public decryptionCount;
+    /// @notice Mapping to track CTX executors allowed to call onDecrypt
+    mapping(address => bool) private _canCallOnDecrypt;
 
     // ============================================
     // EVENTS
@@ -69,7 +86,7 @@ contract SecretSanta {
 
     event Registered(address indexed participant, uint256 totalParticipants);
     event AssignmentComplete(uint256 seed, uint256 totalAssignments);
-    event DecryptionRequested(address indexed requester, address indexed recipient, uint256 requestId);
+    event DecryptionRequested(address indexed requester, address indexed recipient);
     event WishlistRevealed(address indexed santa, address indexed recipient);
 
     // ============================================
@@ -80,7 +97,7 @@ contract SecretSanta {
      * @notice Initialize the Secret Santa contract
      * @param _durationSeconds Registration period duration in seconds
      */
-    constructor(uint256 _durationSeconds) {
+    constructor(uint256 _durationSeconds) Ownable(msg.sender) {
         registrationDeadline = block.timestamp + _durationSeconds;
     }
 
@@ -190,108 +207,78 @@ contract SecretSanta {
     // ============================================
 
     /**
-     * @notice Request to decrypt your recipient's wishlist
-     * @dev Queues the request for batch processing via decryptAndExecute
+     * @notice Request to decrypt your recipient's wishlist with CTX gas payment
+     * @dev Submits CTX for immediate decryption - requires gas payment based on gasprice
      */
-    function requestMyRecipient() external {
+    function requestMyRecipient() external payable {
         require(participants[msg.sender].registered, "Not registered");
         require(assignmentComplete, "Assignment not complete");
+        require(msg.value >= MIN_GAS_PAYMENT, "Insufficient CTX gas payment");
 
         address recipient = santaToRecipient[msg.sender];
         require(recipient != address(0), "No recipient assigned");
         require(recipientWishlists[msg.sender].length == 0, "Already revealed");
 
-        // Find recipient's index in participant list
-        uint256 recipientIndex;
-        for (uint256 i = 0; i < participantList.length; i++) {
-            if (participantList[i] == recipient) {
-                recipientIndex = i;
-                break;
-            }
-        }
+        // Prepare encrypted arguments for CTX
+        bytes[] memory encryptedArgs = new bytes[](1);
+        encryptedArgs[0] = participants[recipient].encryptedWishlist;
 
-        decryptionCount++;
-        decryptionRequests[decryptionCount] = DecryptionRequest({
-            requester: msg.sender,
-            recipientIndex: recipientIndex,
-            fulfilled: false
-        });
+        // Prepare plaintext arguments to pass requester and recipient info
+        bytes[] memory plaintextArgs = new bytes[](1);
+        plaintextArgs[0] = abi.encode(msg.sender, recipient);
 
-        emit DecryptionRequested(msg.sender, recipient, decryptionCount);
-    }
+        // Calculate allowed gas from payment (gasprice is fixed on SKALE)
+        uint256 allowedGas = msg.value / tx.gasprice;
+        require(allowedGas > minCallbackGas, NotEnoughValueSentForGas());
 
-    /**
-     * @notice Trigger BITE decryption for all pending requests
-     * @dev Calls BITE precompile at 0x1b to decrypt encrypted wishlists
-     * @return count Number of decryption requests to process
-     */
-    function decryptAndExecute() external returns (uint256 count) {
-        // Collect encrypted wishlists to decrypt
-        bytes[] memory encryptedToDecrypt = new bytes[](decryptionCount);
-        for (uint256 i = 0; i < decryptionCount; i++) {
-            DecryptionRequest storage req = decryptionRequests[i + 1];
-            if (!req.fulfilled && req.requester != address(0)) {
-                address recipient = participantList[req.recipientIndex];
-                encryptedToDecrypt[i] = participants[recipient].encryptedWishlist;
-            }
-        }
+        // Submit CTX - network will decrypt and call onDecrypt in next block
+        address payable ctxSender = BITE.submitCTX(
+            BITE.SUBMIT_CTX_ADDRESS,
+            allowedGas,
+            encryptedArgs,
+            plaintextArgs
+        );
 
-        // Generate random gas limit for BITE precompile
-        uint256 randomGas = uint256(keccak256(abi.encodePacked(block.timestamp, block.number))) % 2500000 + 1000000;
+        // Whitelist the CTX executor to call onDecrypt
+        _canCallOnDecrypt[ctxSender] = true;
 
-        // Encode input for BITE precompile (0x1b)
-        bytes memory input = abi.encode(randomGas, encryptedToDecrypt);
+        // Transfer gas payment to CTX executor
+        ctxSender.sendValue(msg.value);
 
-        // Call BITE precompile - this will trigger onDecrypt in the next block
-        (bool success, bytes memory result) = address(0x1b).staticcall(input);
-        require(success, "BITE precompile call failed");
-
-        count = decryptionCount;
+        emit DecryptionRequested(msg.sender, recipient);
     }
 
     /**
      * @notice BITE V2 callback - receives decrypted wishlist data
-     * @dev Called by SKALE network after decryptAndExecute
+     * @dev Called by SKALE network after CTX submission
      * @param decryptedArguments Array of decrypted wishlist data
-     * @param plaintextArguments Array of plaintext arguments (unused)
+     * @param plaintextArguments Array of plaintext arguments containing (requester, recipient)
      */
     function onDecrypt(
-        bytes[] memory decryptedArguments,
-        bytes[] memory plaintextArguments
-    ) external {
+        bytes[] calldata decryptedArguments,
+        bytes[] calldata plaintextArguments
+    )
+        external
+        override
+    {
+        // Only the whitelisted CTX executor can call this
+        require(_canCallOnDecrypt[msg.sender], AccessDenied());
+        _canCallOnDecrypt[msg.sender] = false;
 
         // Process each decrypted wishlist
         for (uint256 i = 0; i < decryptedArguments.length; i++) {
-            uint256 requestId = i + 1;
+            // Decode requester and recipient from plaintext arguments
+            (address requester, address recipient) = abi.decode(
+                plaintextArguments[i],
+                (address, address)
+            );
 
-            if (requestId <= decryptionCount) {
-                DecryptionRequest storage request = decryptionRequests[requestId];
+            // Ensure the requester hasn't already revealed
+            if (recipientWishlists[requester].length == 0) {
+                // Store the decrypted wishlist for the requester
+                recipientWishlists[requester] = decryptedArguments[i];
 
-                if (!request.fulfilled && request.requester != address(0)) {
-                    // Store the decrypted wishlist for the requester
-                    recipientWishlists[request.requester] = decryptedArguments[i];
-                    request.fulfilled = true;
-
-                    address recipient = participantList[request.recipientIndex];
-                    emit WishlistRevealed(request.requester, recipient);
-                }
-            }
-        }
-
-        // Handle plaintext arguments if any (for testing)
-        for (uint256 i = 0; i < plaintextArguments.length; i++) {
-            uint256 requestId = uint256(decryptedArguments.length) + i + 1;
-
-            if (requestId <= decryptionCount) {
-                DecryptionRequest storage request = decryptionRequests[requestId];
-
-                if (!request.fulfilled && request.requester != address(0)) {
-                    recipientWishlists[request.requester] = plaintextArguments[i];
-                    request.fulfilled = true;
-
-                    address recipient = participantList[request.recipientIndex];
-                    emit WishlistRevealed(request.requester, recipient);
-                }
+                emit WishlistRevealed(requester, recipient);
             }
         }
     }
@@ -358,5 +345,69 @@ contract SecretSanta {
      */
     function hasRevealed(address _santa) external view returns (bool) {
         return recipientWishlists[_santa].length > 0;
+    }
+
+    // ============================================
+    // TESTING / ADMIN FUNCTIONS
+    // ============================================
+
+    /**
+     * @notice Enable or disable testing mode
+     * @dev Testing mode allows registration to remain open even after deadline
+     * @param _enabled Whether to enable testing mode
+     */
+    function setTestingMode(bool _enabled) external onlyOwner {
+        testingMode = _enabled;
+    }
+
+    /**
+     * @notice Manually set assignment complete status (for testing)
+     * @dev Only callable by owner when testing mode is enabled
+     * @param _status Whether assignment is complete
+     */
+    function setAssignmentComplete(bool _status) external onlyOwner {
+        require(testingMode, "Testing mode not enabled");
+        assignmentComplete = _status;
+    }
+
+    /**
+     * @notice Manually set registration deadline (for testing)
+     * @dev Only callable by owner when testing mode is enabled
+     * @param _newDeadline New registration deadline timestamp
+     */
+    function setRegistrationDeadline(uint256 _newDeadline) external onlyOwner {
+        require(testingMode, "Testing mode not enabled");
+        registrationDeadline = _newDeadline;
+    }
+
+    /**
+     * @notice Manually trigger assignment with minimum participants (for testing)
+     * @dev Only callable by owner when testing mode is enabled with only 1 participant
+     */
+    function emergencyAssignment() external onlyOwner {
+        require(testingMode, "Testing mode not enabled");
+        require(!assignmentComplete, "Assignment already complete");
+        require(participantCount >= 1, "No participants");
+
+        // Generate seed from block properties for pseudo-randomness
+        assignmentSeed = uint256(keccak256(
+            abi.encodePacked(
+                block.timestamp,
+                block.prevrandao,
+                msg.sender,
+                participantCount
+            )
+        ));
+
+        // For testing with 1 participant, assign them to themselves
+        if (participantCount == 1) {
+            santaToRecipient[participantList[0]] = participantList[0];
+        } else {
+            _performDerangement();
+        }
+
+        assignmentComplete = true;
+
+        emit AssignmentComplete(assignmentSeed, participantCount);
     }
 }

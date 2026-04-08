@@ -19,13 +19,26 @@ export default {
     },
   },
   networks: {
+    // SKALE Base Sepolia Testnet
+    skaleBaseSepolia: {
+      url: process.env.SKALE_BASE_SEPOLIA_RPC_URL || 'https://base-sepolia-testnet.skalenodes.com/v1/jubilant-horrible-ancha',
+      chainId: 324705682,
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
+    },
+    // BITE V2 Sandbox 2 Testnet
+    biteV2Sandbox2: {
+      url: process.env.BITE_V2_SANDBOX2_RPC_URL || 'https://base-sepolia-testnet.skalenodes.com/v1/bite-v2-sandbox',
+      chainId: 196243392,
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
+    },
+    // Legacy network name (for backward compatibility)
     skale: {
-      url: process.env.SKALE_RPC_URL || 'https://base-sepolia-testnet.skalenodes.com/v1/miniature-live-tabit',
-      chainId: 2090472038,
+      url: process.env.SKALE_BASE_SEPOLIA_RPC_URL || 'https://base-sepolia-testnet.skalenodes.com/v1/jubilant-horrible-ancha',
+      chainId: 324705682,
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
     },
     hardhat: {
-      chainId: 2090472038,
+      chainId: 324705682,
     },
   },
   paths: {
